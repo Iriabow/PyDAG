@@ -1,21 +1,42 @@
+import sys, os
 from typing import Iterable, Generator, Tuple, List, Callable
 import functools
 import itertools
+import logging
+
+
+class Failure:
+    def __init__(self, circuit_breaking_is_active):
+        self.circuit_breaking_is_active = circuit_breaking_is_active
+
+    def __call__(self, exception: Exception = ValueError("Execution failed")):
+        if not self.circuit_breaking_is_active:
+            raise exception
+        return self
+
 
 class Pipe:
 
-    def __init__(self):
+    # TODO: problems: reuse common nodes, common pipes chaining, without changing node_list...
+    def __init__(self, logger=logging, failure_value=None, circuit_breaking_is_active=True, pipe_name=None):
+        self.circuit_breaking_is_active = circuit_breaking_is_active
         # self.is_batch = is_batch TODO improvement
-        self.node_list: List[Callable] = []
+        # TODO: bug: node_composition, would be overwritten if pipes are compose through method operator.
+        self.node_composition: Callable = None
+        # TODO: bug: blackboard would be overwritten if a pipe is called multiple times.
         self.blackboard = {}
+        # TODO: what happens, when the same pipe is called with different inputs, inputs also should cached.
         self._was_called = False
+        self.logger = logger
+        self.failure_value = failure_value
+        self.failure = Failure(circuit_breaking_is_active)
+        self.pipe_name = pipe_name
 
 
     def __call__(self, *args_input, **kwargs_input):
-        output = self.node_list[0](*args_input, **kwargs_input)
-
-        for node in self.node_list[1:]:
-            output = node(output)
+        output = self.node_composition(*args_input, **kwargs_input)
+        # TODO: check if output is a generator and force generation.
+        self._was_called = True
 
         return output
 
@@ -27,26 +48,20 @@ class Pipe:
                result = list(result) # force generator execution
                # TODO: run inner generators inside result.
 
-        return self.blackboard
+        return self.blackboard.copy()
 
 
     # i node - Simplest node, one input to one output
-    def i_n(self, name: str, worker: Callable, *params, to_blackboard=False, **kwparams) -> "Pipe":
+    def i_n(self, name: str, worker: Callable, *params, to_blackboard=False, debugging=False, **kwparams) -> "Pipe":
         @functools.wraps(worker)
         def wrapper(*args, **kwargs):
-            try:
-                args = args + params
-                kwargs = kwargs | kwparams
+            args = args + params
+            kwargs = kwargs | kwparams
+            output = self._execute("i_n", name, worker, *args, name=name, to_blackboard=to_blackboard, **kwargs)
+            Pipe._debug(debugging, name, output, *args, **kwargs)
+            return output
 
-                output = worker(*args, **kwargs)
-                if to_blackboard:
-                    self.blackboard[name] = output
-                return output
-            except:
-                print(f"Error in i-node {name}")
-                raise
-
-        self.node_list.append(wrapper)
+        self.node_composition = Pipe._compose_functions(self.node_composition, wrapper)
 
         return self
 
@@ -54,7 +69,7 @@ class Pipe:
     @staticmethod
     def _tee_if_forking(wrapper: Callable, forks: int):
         def wrapper_tee(*args, **kwargs):
-            return itertools.tee(wrapper(*args, **kwargs),forks)
+            return itertools.tee(wrapper(*args, **kwargs), forks)
         tee_wrapper = wrapper
         if forks>0:
             tee_wrapper = wrapper_tee
@@ -63,155 +78,185 @@ class Pipe:
 
     # x node: multiple inputs, to multiple outputs.
     # If only one worker is given could be see as batch i node
-    def x_n(self, name: str, *workers: Callable, forks: int=0):
-
-        def execute(parallel_input, worker, count=None):
-            if isinstance(worker, Callable):
-                output = worker(parallel_input)
-                if isinstance(worker, type(self)):
-                    self.blackboard.update(worker.blackboard)
-                return output
-            elif isinstance(worker, Iterable):
-                name_w, worker, params, to_blackboard, kwparams = worker
-                output = worker(parallel_input, *params, **kwparams)
-                if isinstance(worker, type(self)) and to_blackboard:
-                    self.blackboard.update(worker.blackboard)
-                elif to_blackboard:
-                    if count is not None:
-                        name_w = f"{name_w}_{count}"
-                    self.blackboard[name_w] = output
-                return output
+    def x_n(self, name: str, *workers: Callable, forks: int=0, debugging=False):
+        def wrapper(parallel_inputs: Iterable) -> Generator:
+            if len(workers)==1:
+                for count, parallel_input in enumerate(parallel_inputs):
+                    output = self._execute("x_n", name, workers[0], parallel_input, count=count, step=count)
+                    Pipe._debug(debugging, name, output, parallel_input)
+                    yield output
             else:
-                raise ValueError("worker should be Callable a tuple -> (Callable, tuple, dict)")
+                if len(workers)!=len(parallel_inputs):
+                    raise ValueError("When more than one worker are given, number should be the same than of input data")
+                for count, (parallel_input, worker) in enumerate(zip(parallel_inputs, workers)):
+                    output = self._execute("x_n", name, worker, parallel_input, step=count)
+                    Pipe._debug(debugging, name, output, parallel_input)
+                    yield output
 
-        def wrapper(parallel_inputs: Generator) -> Generator:
-            try:
-                parallel_count = 0
-                if len(workers)==1:
-                    for count, parallel_input in enumerate(parallel_inputs):
-                        parallel_count = count
-                        yield execute(parallel_input, workers[0], count)
-                else:
-                    if len(workers)!=len(parallel_inputs):
-                        raise ValueError("Whe more than one worker are given, number should be the same than of input data")
-                    for count, (parallel_input, worker) in enumerate(zip(parallel_inputs, workers)):
-                        parallel_count = count
-                        yield execute(parallel_input, worker)
-            except:
-                print(f"Error in x-node {name}, for parallel element {parallel_count}")
-                raise
-
-        wrapper_to_append = Pipe._tee_if_forking(wrapper, forks)
-
-        self.node_list.append(wrapper_to_append)
+        wrapper_to_compose = Pipe._tee_if_forking(wrapper, forks)
+        self.node_composition = Pipe._compose_functions(self.node_composition, wrapper_to_compose)
 
         return self
 
 
     # λ node - One input unfolded to multiple outputs
     # noinspection NonAsciiCharacters
-    def λ_n(self, name: str, *unfolding_workers: Callable, forks: int=0) -> "Pipe":
+    def λ_n(self, name: str, *unfolding_workers: Callable, forks: int=0, debugging=False) -> "Pipe":
         # TODO: might could be a good idea to separete forks functionality, somethind like λ_tee
         def wrapper(*args, **kwargs) -> Generator:
-            try:
-                for count, worker in enumerate(unfolding_workers):
-                    folded_count = count
-                    if isinstance(worker, Callable):
-                        output = worker(*args, **kwargs)
-                        if isinstance(worker, type(self)):
-                            self.blackboard.update(worker.blackboard)
-                        yield output
-                    elif isinstance(worker, Iterable):
-                        name_w, worker, params, to_blackboard, kwparams = worker
-                        args_ = args + params
-                        kwargs_ = kwargs | kwparams
-                        output = worker(*args_, **kwargs_)
-                        if isinstance(worker, type(self)) and to_blackboard:
-                            self.blackboard.update(worker.blackboard)
-                        elif to_blackboard:
-                            self.blackboard[name_w] = output
-                        yield output
-                    else:
-                        raise ValueError("unfolding_worker, should be Callable a tuple -> (Callable, tuple, dict)")
-            except:
-                print(f"Error in lambda-node {name}, for unfold number {folded_count}")
-                raise
+            for count, worker in enumerate(unfolding_workers):
+                output = self._execute("λ_n", name, worker, *args, step=count, **kwargs)
+                Pipe._debug(debugging, name, output, *args, **kwargs)
+                yield output
 
-            wrapper_to_append = Pipe._tee_if_forking(wrapper, forks)
-
-            self.node_list.append(wrapper_to_append)
+        wrapper_to_compose = Pipe._tee_if_forking(wrapper, forks)
+        self.node_composition = Pipe._compose_functions(self.node_composition, wrapper_to_compose)
 
         return self
 
 
     # y node - Multiple inputs folded to one output
-    def y_n(self, name: str, folding_worker: Callable, *params, to_blackboard=False, **kwparams) -> "Pipe":
+    def y_n(self, name: str, folding_worker: Callable, *params, to_blackboard=False, debugging=False, **kwparams) -> "Pipe":
+
         @functools.wraps(folding_worker)
-        def wrapper(to_fold: Generator):
-            try:
+        def wrapper(to_fold: Iterable):
+            output = self._execute("y_n", name,
+                                   folding_worker, to_fold, *params, name=name, to_blackboard=to_blackboard, **kwparams)
 
-                output = folding_worker(to_fold, *params, **kwparams)
+            Pipe._debug(debugging, name, output, *to_fold)
+            return output
 
-                if to_blackboard:
-                    self.blackboard[name] = output
-
-                return output
-            except:
-                print(f"Error in upsilon-node {name}")
-                raise
-
-        self.node_list.append(wrapper)
+        self.node_composition = Pipe._compose_functions(self.node_composition, wrapper)
 
         return self
 
 
-
-    # y node flatten - Multiple inputs folded to one output, this case flatten all elements to a list
+    # y node flatten generator - Multiple inputs folded to one output, this case flatten all elements to a list
     def y_n_flatten(self, name: str) -> "Pipe":
 
-        def flatten(to_fold: Generator):
-            try:
-                return list(to_fold)
-            except:
-                print(f"Error in upsilon-flatten-node {name}")
-                raise
+        def flatten(to_fold: Iterable):
 
-        self.node_list.append(flatten)
+            return self._failure_controlled_execution("y_n_flatten", name, list, to_fold)
+
+        self.node_composition = Pipe._compose_functions(self.node_composition, flatten)
 
         return self
 
 
-    def  i_n_to_blackboard_and_continue(self, name: str, to_save: Callable, *args, **kwargs):
+    def i_n_do_and_continue(self, name: str, to_save: Callable, *args, to_blackboard=False, debugging=False, **kwargs):
+
         return self.λ_n(f"save_and_continue_{name}",
-                        Pipe.w(name, to_save, *args, to_blackboard=True, **kwargs),
-                        Pipe.w(f"sub_continue_{name}", Pipe.identity)) \
-                   .y_n(f"continue_{name}", Pipe.y_c_get_one)
+                        Pipe.w(name, to_save, *args, to_blackboard=to_blackboard, **kwargs),
+                        Pipe.w(f"sub_continue_{name}", Pipe.identity),
+                        debugging=debugging) \
+                   .y_n(f"continue_{name}", Pipe.y_c_get_one, debugging=debugging)
 
 
-    @classmethod
-    def w(cls, name: str, worker: Callable, *params, to_blackboard=False, **kwparams):
+    @staticmethod
+    def w(name: str, worker: Callable, *params, to_blackboard=False, **kwparams):
+
         return name, worker, params, to_blackboard, kwparams
 
 
     @classmethod
     def identity(cls, input):
+
         return input
 
 
     @classmethod
-    def y_c_get_one(cls, to_combine: Generator, index_to_get=-1):
+    def y_c_get_one(cls, to_combine: Iterable, index_to_get=-1):
+
         generations_list = list(to_combine)
+
         return generations_list[index_to_get]
 
 
     @classmethod
-    def auto_fold(cls, folding: Callable, *params, **kwparams):
+    def auto_fold_with(cls, folding: Callable, *params, **kwparams) -> Callable:
+
         @functools.wraps(folding)
         def wrapper(to_fold, *args, **kwargs):
             args = args + params
             kwargs = kwargs | kwparams
-            return  folding(*to_fold,*args, **kwargs)
+
+            return folding(*to_fold,*args, **kwargs)
+
         return wrapper
+
+
+    @staticmethod
+    def _compose_functions(first_step: Callable, second_step: Callable) -> Callable:
+        if not first_step: # initially self.node_composition, would be None
+            return second_step
+
+        def composition(*args, **kwargs):
+            output = first_step(*args, **kwargs)
+
+            return second_step(output)
+
+        return composition
+
+
+    def _execute(self, node_type, node_name, worker, *args, count=None, name=None, to_blackboard=False, **kwargs):
+
+        def save_to_blackboard(name, output, to_blackboard_w=False):
+            if isinstance(worker, type(self)):
+                self.blackboard.update(worker.blackboard)
+            elif to_blackboard or to_blackboard_w:
+                if count is not None:
+                    name = f"{name}_{count}"
+                if isinstance(output, Failure):
+                    output = self.failure_value
+                self.blackboard[name] = output
+
+        if isinstance(worker, Callable):
+            output = self._failure_controlled_execution(node_type, node_name, worker, *args, **kwargs)
+            save_to_blackboard(name, output)
+
+            return output
+
+        elif isinstance(worker, Iterable):
+            name_w, worker, params, to_blackboard_w, kwparams = worker
+            output = self._failure_controlled_execution(node_type, node_name, worker, *args, *params,**kwargs, **kwparams)
+
+            save_to_blackboard(name_w, output, to_blackboard_w)
+
+            return output
+
+        else:
+            raise ValueError("worker should be Callable or a tuple -> (Callable, tuple, dict)")
+
+
+    def _failure_controlled_execution(self, node_type, node_name, worker: Callable, *args, step=None, **kwargs):
+        try:
+            # If worker is a Pipe should be called to generate its own failure_values in its dictionary.
+            if args and isinstance(args[0], Failure) and not isinstance(worker, type(self)):
+
+                return args[0]
+
+            return worker(*args, **kwargs)
+
+        except Exception as failure:
+
+            if isinstance(worker, Iterable):
+                name_w, worker, params, to_blackboard, kwparams = worker
+                node_name = f"{node_name} in subnode {name_w}"
+            elif step:
+                node_name = f"{node_name} in step {step}"
+
+            self.logger.error(f" in {node_type} with name {node_name}:\n {failure}")
+
+            return self.failure(exception=failure)
+
+
+    @staticmethod
+    def _debug(debugging:bool, node_name, output, *args, **kwargs, ):
+        if debugging:
+            print(f"node: {node_name}")
+            print(f"args: {args}")
+            print(f"kwargs: {kwargs}")
+            print(f"output: {output}")
 
 
 # usage example
